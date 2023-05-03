@@ -78,6 +78,9 @@ class SPhononBSPlotter(PhononBSPlotter):
         no_base_style=False,
         from_json=None,
         legend=None,
+        legend_labels=None,
+        line_style=None,
+        handles=None
     ):
         """Get a :obj:`matplotlib.pyplot` object of the phonon band structure.
 
@@ -127,7 +130,7 @@ class SPhononBSPlotter(PhononBSPlotter):
             elif len(legend) == len(from_json):
                 legend = [""] + list(legend)
             else:
-                raise ValueError("Inappropriate number of legend entries")
+                raise ValueError("Inappropriate number of legend entries")  
 
         if color is None:
             color = "C0"  # Default to first colour in matplotlib series
@@ -149,7 +152,7 @@ class SPhononBSPlotter(PhononBSPlotter):
             plt = pretty_plot(width, height, dpi=dpi, plt=plt)
             ax = plt.gca()
 
-        def _plot_lines(data, ax, color=None, alpha=1, zorder=1):
+        def _plot_lines(data, ax, color=None, alpha=1, zorder=1, ls=line_style):
             """Pull data from any PhononBSPlotter and add to axis"""
             dists = data["distances"]
             freqs = data["frequency"]
@@ -161,7 +164,7 @@ class SPhononBSPlotter(PhononBSPlotter):
                 f = freqs[nd][nb]
 
                 # plot band data
-                ax.plot(dists[nd], f, ls="-", c=color, zorder=zorder)
+                ax.plot(dists[nd], f, ls=ls, c=color, zorder=zorder)
 
         data = self.bs_plot_data()
         _plot_lines(data, ax, color=color)
@@ -189,6 +192,10 @@ class SPhononBSPlotter(PhononBSPlotter):
                 [Line2D([0], [0], color=f"C{i}") for i in range(len(legend))],
                 legend,
             )
+
+        # Add the legends to the plot
+        legend = ax.legend(handles, legend_labels, loc='upper right', facecolor='white')
+        # legend.set_alpha(1.0)  # Set alpha value to 100%
 
         self._maketicks(ax, units=units)
         self._makeplot(
@@ -233,7 +240,7 @@ class SPhononBSPlotter(PhononBSPlotter):
             ymin = 0 if tymin >= self.imag_tol else tymin - pad
         ymax = ymax if ymax else tymax + pad
 
-        ax.set_ylim(ymin, ymax)
+        # ax.set_ylim(ymin, ymax)
         ax.set_xlim(0, data["distances"][-1][-1])
 
         if ymin < 0:
