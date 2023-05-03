@@ -1,246 +1,157 @@
+# Copyright (c) Scanlon Materials Theory Group
+# Distributed under the terms of the MIT License.
+
 """
-A script to plot electronic band structure diagrams.
+A script to plot phonon band structure diagrams.
 
 TODO:
- - Replace the elements and project formats with the dream syntax
+ * automatically plot dos if present in band.yaml
+ * make band structure from vasprun displacement/DFPT files
+ * deal with magnetic moments
+ * Read force_constants.hdf5
+ * read settings from phonopy config file
+ * prefix file names
 """
 
-
 import argparse
-import glob
+import json
 import logging
 import os
 import sys
 import warnings
+from os.path import isfile
 
+import numpy as np
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="h5py")
 import matplotlib as mpl
-from pkg_resources import Requirement, resource_filename
-from pymatgen.electronic_structure.bandstructure import get_reconstructed_band_structure
-from pymatgen.electronic_structure.core import Spin
-from pymatgen.io.vasp.outputs import BSVasprun
 
 mpl.use("Agg")
+from matplotlib import rcParams
+from phonopy.units import CmToEv, THzToCm, VaspToCm, VaspToEv, VaspToTHz
+from pymatgen.io.phonopy import get_ph_bs_symm_line
+from pymatgen.io.vasp.inputs import Poscar
+from pymatgen.phonon.bandstructure import PhononBandStructureSymmLine
 
-from sumo.cli.dosplot import _atoms, _el_orb
-from sumo.electronic_structure.bandstructure import string_to_spin
-from sumo.electronic_structure.dos import load_dos
-from sumo.io.castep import band_structure as castep_band_structure
-from sumo.io.castep import read_dos as read_castep_dos
-from sumo.io.questaal import QuestaalSite
-from sumo.io.questaal import band_structure as questaal_band_structure
-from sumo.io.questaal import labels_from_syml
-from sumo.plotting.bs_plotter import SBSPlotter
-from sumo.plotting.dos_plotter import SDOSPlotter
-
-try:
-    import configparser
-except ImportError:
-    import ConfigParser as configparser
+from sumo.io.castep import CastepPhonon
+from sumo.phonon.phonopy import load_phonopy
+from sumo.plotting.phonon_bs_plotter import SPhononBSPlotter
+from sumo.symmetry.kpoints import get_path_data
 
 __author__ = "Alex Ganose"
 __version__ = "1.0"
 __maintainer__ = "Alex Ganose"
 __email__ = "alexganose@googlemail.com"
-__date__ = "July 18, 2017"
+__date__ = "Jan 17, 2018"
 
 
-def bandplot(
-    filenames=None,
-    code="vasp",
+def phonon_bandplot(
+    # filename,
+    filenames,
+    # poscar=None,
+    poscars=None,
     prefix=None,
     directory=None,
-    vbm_cbm_marker=False,
-    projection_selection=None,
-    mode="rgb",
-    normalise="all",
-    interpolate_factor=4,
-    color1="#FF0000",
-    color2="#0000FF",
-    color3="#00FF00",
-    colorspace="lab",
-    circle_size=150,
-    dos_file=None,
-    cart_coords=False,
-    scissor=None,
-    ylabel="Energy (eV)",
-    dos_label=None,
-    zero_line=False,
-    zero_energy=None,
-    elements=None,
-    lm_orbitals=None,
-    atoms=None,
-    spin=None,
-    total_only=False,
-    plot_total=True,
-    legend_cutoff=3,
-    gaussian=None,
-    height=None,
-    width=None,
-    ymin=-6.0,
-    ymax=6.0,
-    colours=None,
-    yscale=1,
+    dim=None,
+    born=None,
+    qmesh=None,
+    spg=None,
+    primitive_axis=None,
+    line_density=60,
+    units="THz",
+    symprec=0.01,
+    mode="bradcrack",
+    kpt_list=None,
+    eigenvectors=None,
+    labels=None,
+    height=6.0,
+    width=6.0,
     style=None,
     no_base_style=False,
+    ymin=None,
+    ymax=None,
     image_format="pdf",
     dpi=400,
     plt=None,
     fonts=None,
+    dos=None,
+    to_json=None,
+    from_json=None,
+    to_web=None,
+    legend=None,
+    colors=None,
+    legend_labels=None,
+    line_style=None,
+    handles=None
 ):
-    """Plot electronic band structure diagrams from vasprun.xml files.
+    """A script to plot phonon band structure diagrams.
 
     Args:
-        filenames (:obj:`str` or :obj:`list`, optional): Path to input files:
-
-            Vasp:
-                Use vasprun.xml or vasprun.xml.gz file.
-            Questaal:
-                Path to a bnds.ext file. The extension will also be used to
-                find site.ext and syml.ext files in the same directory.
-            Castep:
-                Path to a seedname.bands file. The prefix ("seedname") is used
-                to locate a seedname.cell file in the same directory and read
-                in the positions of high-symmetry points.
-
-            If no filenames are provided, sumo
-            will search for vasprun.xml or vasprun.xml.gz files in folders
-            named 'split-0*'. Failing that, the code will look for a vasprun in
-            the current directory. If a :obj:`list` of vasprun files is
-            provided, these will be combined into a single band structure.
-
-        code (:obj:`str`, optional): Calculation type. Default is 'vasp';
-            'questaal' and 'castep' also supported (with a reduced
-            feature-set).
+        filename (str): Path to phonopy output. Can be a band structure yaml
+            file, ``FORCE_SETS``, ``FORCE_CONSTANTS``, or
+            ``force_constants.hdf5``.
+        poscar (:obj:`str`, optional): Path to POSCAR file of unitcell. Not
+            required if plotting the phonon band structure from a yaml file. If
+            not specified, the script will search for a POSCAR file in the
+            current directory.
         prefix (:obj:`str`, optional): Prefix for file names.
         directory (:obj:`str`, optional): The directory in which to save files.
-        vbm_cbm_marker (:obj:`bool`, optional): Plot markers to indicate the
-            VBM and CBM locations.
-        projection_selection (list): A list of :obj:`tuple` or :obj:`string`
-            identifying which elements and orbitals to project on to the
-            band structure. These can be specified by both element and
-            orbital, for example, the following will project the Bi s, p
-            and S p orbitals::
+        dim (:obj:`list`, optional): supercell matrix
+        born (:obj:`str`, optional): Path to file containing Born effective
+            charges. Should be in the same format as the file produced by the
+            ``phonopy-vasp-born`` script provided by phonopy.
+        qmesh (:obj:`list` of :obj:`int`, optional): Q-point mesh to use for
+            calculating the density of state. Formatted as a 3x1 :obj:`list` of
+            :obj:`int`.
+        spg (:obj:`str` or :obj:`int`, optional): The space group international
+            number or symbol to override the symmetry determined by spglib.
+            This is not recommended and only provided for testing purposes.
+            This option will only take effect when ``mode = 'bradcrack'``.
+        primitive_axis (:obj:`list` or :obj:`str`, optional): The
+            transformation matrix from the conventional to primitive cell. Only
+            required when the conventional cell was used as the starting
+            structure. Should be provided as a 3x3 :obj:`list` of
+            :obj:`float`. Alternatively the string 'auto' may be used to
+            request that a primitive matrix is determined automatically.
+        line_density (:obj:`int`, optional): Density of k-points along the
+            path.
+        units (:obj:`str`, optional): Units of phonon frequency. Accepted
+            (case-insensitive) values are Thz, cm-1, eV, meV.
+        symprec (:obj:`float`, optional): Tolerance for space-group-finding
+            operations
+        mode (:obj:`str`, optional): Method used for calculating the
+            high-symmetry path. The options are:
 
-                [('Bi', 's'), ('Bi', 'p'), ('S', 'p')]
+            bradcrack
+                Use the paths from Bradley and Cracknell. See [brad]_.
 
-            If just the element is specified then all the orbitals of
-            that element are combined. For example, to sum all the S
-            orbitals::
+            pymatgen
+                Use the paths from pymatgen. See [curt]_.
 
-                [('Bi', 's'), ('Bi', 'p'), 'S']
+            seekpath
+                Use the paths from SeeK-path. See [seek]_.
 
-            You can also choose to sum particular orbitals by supplying a
-            :obj:`tuple` of orbitals. For example, to sum the S s, p, and
-            d orbitals into a single projection::
+        kpt_list (:obj:`list`, optional): List of k-points to use, formatted as
+            a list of subpaths, each containing a list of fractional k-points.
+            For example::
 
-                [('Bi', 's'), ('Bi', 'p'), ('S', ('s', 'p', 'd'))]
+                [ [[0., 0., 0.], [0., 0., 0.5]],
+                  [[0.5, 0., 0.], [0.5, 0.5, 0.]] ]
 
-            If ``mode = 'rgb'``, a maximum of 3 orbital/element
-            combinations can be plotted simultaneously (one for red, green
-            and blue), otherwise an unlimited number of elements/orbitals
-            can be selected.
-        mode (:obj:`str`, optional): Type of projected band structure to
-            plot. Options are:
+            Will return points along ``0 0 0 -> 0 0 1/2 | 1/2 0 0
+            -> 1/2 1/2 0``
+        labels (:obj:`list`, optional): The k-point labels. These should
+            be provided as a :obj:`list` of :obj:`str` for each subpath of the
+            overall path. For example::
 
-                "rgb"
-                    The band structure line color depends on the character
-                    of the band. Each element/orbital contributes either
-                    red, green or blue with the corresponding line colour a
-                    mixture of all three colours. This mode only supports
-                    up to 3 elements/orbitals combinations. The order of
-                    the ``selection`` :obj:`tuple` determines which colour
-                    is used for each selection.
-                "stacked"
-                    The element/orbital contributions are drawn as a
-                    series of stacked circles, with the colour depending on
-                    the composition of the band. The size of the circles
-                    can be scaled using the ``circle_size`` option.
+                [ ['Gamma', 'Z'], ['X', 'M'] ]
 
-        normalise (:obj:`str`, optional): Normalisation the projections.
-            Options are:
-
-              * ``'all'``: Projections normalised against the sum of all
-                   other projections.
-              * ``'select'``: Projections normalised against the sum of the
-                   selected projections.
-              * ``None``: No normalisation performed.
-
-        color1 (str): A color specified in any way supported by matplotlib. Used
-            when ``mode = 'rgb'``.
-        color2 (str): A color specified in any way supported by matplotlib. Used
-            when ``mode = 'rgb'``.
-        color3 (str): A color specified in any way supported by matplotlib. Used
-            when ``mode = 'rgb'``.
-        colorspace (str): The colorspace in which to perform the interpolation. The
-            allowed values are rgb, hsv, lab, luvlc, lablch, and xyz. Used
-            when ``mode = 'rgb'``.
-        circle_size (:obj:`float`, optional): The area of the circles used
-            when ``mode = 'stacked'``.
-        cart_coords (:obj:`bool`, optional): Whether the k-points are read as
-            cartesian or reciprocal coordinates. This is only required for
-            Questaal output; Vasp output is less ambiguous. Defaults to
-            ``False`` (fractional coordinates).
-        scissor (:obj:`float`, optional): Apply a scissor operator (rigid shift
-            of the CBM), use with caution if applying to metals.
-        dos_file (:obj:`str`, optional): Path to vasprun.xml file from which to
-            read the density of states information. If set, the density of
-            states will be plotted alongside the bandstructure.
-        zero_line (:obj:`bool`, optional): If true, draw a horizontal line at
-            zero energy. (To adjust where zero energy sits, use zero_energy.)
-        zero_energy (:obj:`float`, optional): Energy offset determining position
-            of zero energy. By default, this is the VBM. It may be useful to
-            set this to e.g. a calculated self-consistent Fermi energy.
-        elements (:obj:`dict`, optional): The elements and orbitals to extract
-            from the projected density of states. Should be provided as a
-            :obj:`dict` with the keys as the element names and corresponding
-            values as a :obj:`tuple` of orbitals. For example, the following
-            would extract the Bi s, px, py and d orbitals::
-
-                {'Bi': ('s', 'px', 'py', 'd')}
-
-            If an element is included with an empty :obj:`tuple`, all orbitals
-            for that species will be extracted. If ``elements`` is not set or
-            set to ``None``, all elements for all species will be extracted.
-        lm_orbitals (:obj:`dict`, optional): The orbitals to decompose into
-            their lm contributions (e.g. p -> px, py, pz). Should be provided
-            as a :obj:`dict`, with the elements names as keys and a
-            :obj:`tuple` of orbitals as the corresponding values. For example,
-            the following would be used to decompose the oxygen p and d
-            orbitals::
-
-                {'O': ('p', 'd')}
-
-        atoms (:obj:`dict`, optional): Which atomic sites to use when
-            calculating the projected density of states. Should be provided as
-            a :obj:`dict`, with the element names as keys and a :obj:`tuple` of
-            :obj:`int` specifying the atomic indices as the corresponding
-            values. The elemental projected density of states will be summed
-            only over the atom indices specified. If an element is included
-            with an empty :obj:`tuple`, then all sites for that element will
-            be included. The indices are 0 based for each element specified in
-            the POSCAR. For example, the following will calculate the density
-            of states for the first 4 Sn atoms and all O atoms in the
-            structure::
-
-                {'Sn': (1, 2, 3, 4), 'O': (, )}
-
-            If ``atoms`` is not set or set to ``None`` then all atomic sites
-            for all elements will be considered.
-        spin (:obj:`Spin`, optional): Plot only one spin channel from a
-            spin-polarised calculation; "up" or "1" for spin up only, "down" or
-            "-1" for spin down only. Defaults to ``None``.
-        total_only (:obj:`bool`, optional): Only extract the total density of
-            states. Defaults to ``False``.
-        plot_total (:obj:`bool`, optional): Plot the total density of states.
-            Defaults to ``True``.
-        legend_cutoff (:obj:`float`, optional): The cut-off (in % of the
-            maximum density of states within the plotting range) for an
-            elemental orbital to be labelled in the legend. This prevents
-            the legend from containing labels for orbitals that have very
-            little contribution in the plotting range.
-        gaussian (:obj:`float`, optional): Broaden the density of states using
-            convolution with a gaussian function. This parameter controls the
-            sigma or standard deviation of the gaussian distribution.
+            combined with the above example for ``kpt_list`` would indicate the
+            path: Gamma -> Z | X -> M. If no labels are provided, letters from
+            A -> Z will be used instead.
+        eigenvectors (:obj:`bool`, optional): Write the eigenvectors to the
+            yaml file. (Always True if to_web is set.)
+        dos (str): Path to Phonopy total dos .dat file
         height (:obj:`float`, optional): The height of the plot.
         width (:obj:`float`, optional): The width of the plot.
         ymin (:obj:`float`, optional): The minimum energy on the y-axis.
@@ -249,18 +160,6 @@ def bandplot(
             specifications, to be composed on top of Sumo base style.
         no_base_style (:obj:`bool`, optional): Prevent use of sumo base style.
             This can make alternative styles behave more predictably.
-        colours (:obj:`dict`, optional): Use custom colours for specific
-            element and orbital combinations. Specified as a :obj:`dict` of
-            :obj:`dict` of the colours. For example::
-
-                {
-                    'Sn': {'s': 'r', 'p': 'b'},
-                    'O': {'s': '#000000'}
-                }
-
-            The colour can be a hex code, series of rgb value, or any other
-            format supported by matplotlib.
-        yscale (:obj:`float`, optional): Scaling factor for the y-axis.
         image_format (:obj:`str`, optional): The image file format. Can be any
             format supported by matplotlib, including: png, jpg, pdf, and svg.
             Defaults to pdf.
@@ -271,325 +170,325 @@ def bandplot(
         fonts (:obj:`list`, optional): Fonts to use in the plot. Can be a
             a single font, specified as a :obj:`str`, or several fonts,
             specified as a :obj:`list` of :obj:`str`.
+        to_json (:obj:`str`, optional): JSON file to dump the Pymatgen band
+            path object.
+        from_json (:obj:`list` or :obj:`str`, optional): (List of) JSON
+            bandpath data filename(s) to import and overlay.
+        to_web (:obj:`str`, optional): JSON file to write data for
+            visualisation with http://henriquemiranda.github.io/phononwebsite
+        legend (:obj:`list` or :obj:`None`, optional): Legend labels. If None,
+            don't add a legend. With a list length equal to from_json, label
+            json inputs only. With one extra list entry, label all lines
+            beginning with new plot.
 
     Returns:
-        If ``plt`` set then the ``plt`` object will be returned. Otherwise, the
-        method will return a :obj:`list` of filenames written to disk.
+        A matplotlib pyplot object.
     """
-    if not filenames:
-        filenames = find_vasprun_files()
-    elif isinstance(filenames, str):
-        filenames = [filenames]
+    save_files = False if plt else True  # don't save if pyplot object provided
+    if isinstance(from_json, str):
+        from_json = [from_json]
 
-    # only load the orbital projects if we definitely need them
-    parse_projected = True if projection_selection else False
-
-    # now load all the band structure data and combine using the
-    # get_reconstructed_band_structure function from pymatgen
-    bandstructures = []
-    if code == "vasp":
-        for vr_file in filenames:
-            vr = BSVasprun(vr_file, parse_projected_eigen=parse_projected)
-            bs = vr.get_band_structure(line_mode=True)
-            bandstructures.append(bs)
-        bs = get_reconstructed_band_structure(bandstructures)
-    elif code == "castep":
-        for bands_file in filenames:
-            cell_file = _replace_ext(bands_file, "cell")
-            if os.path.isfile(cell_file):
-                logging.info(f"Found cell file {cell_file}...")
-            else:
-                logging.info(f"Did not find cell file {cell_file}...")
-                cell_file = None
-            bs = castep_band_structure(bands_file, cell_file=cell_file)
-            bandstructures.append(bs)
-        bs = get_reconstructed_band_structure(bandstructures)
-    elif code == "questaal":
-        bnds_file = filenames[0]
-        ext = bnds_file.split(".")[-1]
-        bnds_folder = os.path.join(bnds_file, os.path.pardir)
-
-        site_file = os.path.abspath(os.path.join(bnds_folder, f"site.{ext}"))
-
-        if os.path.isfile(site_file):
-            logging.info("site file found, reading lattice...")
-            site_data = QuestaalSite.from_file(site_file)
-            bnds_lattice = site_data.structure.lattice
-            alat = site_data.alat
+    if eigenvectors is None:
+        if to_web is None:
+            eigenvectors = False
         else:
-            raise OSError(
-                f"Site file {site_file} not found: needed to determine lattice"
+            eigenvectors = True
+    elif not eigenvectors and to_web is not None:
+        raise ValueError("Cannot set eigenvectors=False and write web JSON")
+
+    if filenames is None:   
+        if from_json is None:
+            filename = "FORCE_SETS"
+            bs, phonon = _bs_from_filename(
+                filename,
+                poscar,
+                dim,
+                symprec,
+                spg,
+                kpt_list,
+                labels,
+                primitive_axis,
+                units,
+                born,
+                mode,
+                eigenvectors,
+                line_density,
             )
 
-        syml_file = os.path.abspath(os.path.join(bnds_folder, f"syml.{ext}"))
-        if os.path.isfile(syml_file):
-            logging.info("syml file found, reading special-point labels...")
-            bnds_labels = labels_from_syml(syml_file)
         else:
-            logging.info("syml file not found, band structure lacks labels")
-            bnds_labels = {}
-
-        bs = questaal_band_structure(
-            bnds_file,
-            bnds_lattice,
-            alat=alat,
-            labels=bnds_labels,
-            coords_are_cartesian=cart_coords,
-        )
-
-    # currently not supported as it is a pain to make subplots within subplots,
-    # although need to check this is still the case
-    if "split" in mode and dos_file:
-        logging.error(
-            "ERROR: Plotting split projected band structure with DOS"
-            " not supported.\nPlease use --projected-rgb or "
-            "--projected-stacked options."
-        )
-        sys.exit()
-
-    if projection_selection and mode == "rgb" and len(projection_selection) > 3:
-        logging.error(
-            "ERROR: RGB projected band structure only "
-            "supports up to 3 elements/orbitals."
-            "\nUse alternative --mode setting."
-        )
-        sys.exit()
-
-    # don't save if pyplot object provided
-    save_files = False if plt else True
-    spin = string_to_spin(spin)  # Convert spin name to pymatgen Spin object
-
-    dos_plotter = None
-    dos_opts = None
-    if dos_file:
-        if code == "vasp":
-            dos, pdos = load_dos(
-                dos_file,
-                elements,
-                lm_orbitals,
-                atoms,
-                gaussian,
-                total_only,
-                scissor=scissor,
-            )
-        elif code == "castep":
-            if scissor:
-                raise ValueError("Scissor not compatabile with CASTEP DOS.")
-            pdos_file = None
-            if cell_file:
-                pdos_file = _replace_ext(cell_file, "pdos_bin")
-                if not os.path.isfile(pdos_file):
-                    pdos_file = None
-                    logging.info(
-                        f"PDOS file {pdos_file} does not exist, "
-                        "falling back to TDOS."
-                    )
-                else:
-                    logging.info(f"Found PDOS file {pdos_file}")
-            else:
-                logging.info(f"Cell file {cell_file} does not exist, cannot plot PDOS.")
-
-            dos, pdos = read_castep_dos(
-                dos_file,
-                pdos_file=pdos_file,
-                cell_file=cell_file,
-                gaussian=gaussian,
-                lm_orbitals=lm_orbitals,
-                elements=elements,
-                efermi_to_vbm=True,
-            )
-
-        dos_plotter = SDOSPlotter(dos, pdos)
-        dos_opts = {
-            "plot_total": plot_total,
-            "legend_cutoff": legend_cutoff,
-            "colours": colours,
-            "yscale": yscale,
-        }
-
-    if scissor:
-        bs = bs.apply_scissor(scissor)
-
-    plotter = SBSPlotter(bs)
-    if projection_selection:
-        plt = plotter.get_projected_plot(
-            projection_selection,
-            mode=mode,
-            normalise=normalise,
-            interpolate_factor=interpolate_factor,
-            color1=color1,
-            color2=color2,
-            color3=color3,
-            colorspace=colorspace,
-            circle_size=circle_size,
-            zero_to_efermi=True,
-            zero_line=zero_line,
-            zero_energy=zero_energy,
-            ymin=ymin,
-            ymax=ymax,
-            height=height,
-            width=width,
-            vbm_cbm_marker=vbm_cbm_marker,
-            ylabel=ylabel,
-            plt=plt,
-            dos_plotter=dos_plotter,
-            dos_options=dos_opts,
-            dos_label=dos_label,
-            fonts=fonts,
-            style=style,
-            no_base_style=no_base_style,
-            spin=spin,
-        )
+            logging.info(f"No input data, using file {from_json[0]} to construct plot")
+            with open(from_json[0]) as f:
+                bs = PhononBandStructureSymmLine.from_dict(json.load(f))
+            from_json = from_json[1:]
+            phonon = None
     else:
+        # Initialize an empty list to store the bs
+        bs_list = []
+
+        # Loop through the filenames and compute the bs for each file
+        # for filename in filenames:
+        for i, (filename, poscar) in enumerate(zip(filenames, poscars)):
+            bs, phonon = _bs_from_filename(
+                filename,
+                poscar,
+                dim,
+                symprec,
+                spg,
+                kpt_list,
+                labels,
+                primitive_axis,
+                units,
+                born,
+                mode,
+                eigenvectors,
+                line_density,
+            )
+            
+            # Append the bs to the list
+            bs_list.append(bs)
+
+    if to_json is not None:
+        logging.info(f"Writing symmetry lines to {to_json}")
+        with open(to_json, "wt") as f:
+            f.write(bs.to_json())
+
+    if to_web is not None:
+        logging.info(f"Writing visualisation JSON to {to_web}")
+        bs.write_phononwebsite(to_web)
+
+    
+    # plot all the bs objects
+    for i, (bs_i, dos_i) in enumerate(zip(bs_list, dos)):
+        if dos_i is not None:
+            if phonon is None:
+                logging.error("Cannot use phonon DOS without Phonopy")
+                sys.exit()
+
+            if isfile(dos_i):
+                dos_i = np.genfromtxt(dos_i, comments="#")
+            elif dos_i:
+                phonon.set_mesh(
+                    qmesh,
+                    is_gamma_center=False,
+                    is_eigenvectors=True,
+                    is_mesh_symmetry=False,
+                )
+                phonon.set_total_DOS()
+                dos_freq, dos_val = phonon.get_total_DOS()
+                dos_i = np.zeros((len(dos_freq), 2))
+                dos_i[:, 0], dos_i[:, 1] = dos_freq, dos_val
+
+
+        plotter = SPhononBSPlotter(bs_i)
         plt = plotter.get_plot(
-            zero_to_efermi=True,
-            zero_line=zero_line,
-            zero_energy=zero_energy,
+            units=units,
             ymin=ymin,
             ymax=ymax,
             height=height,
             width=width,
-            vbm_cbm_marker=vbm_cbm_marker,
-            ylabel=ylabel,
             plt=plt,
-            dos_plotter=dos_plotter,
-            dos_options=dos_opts,
-            dos_label=dos_label,
             fonts=fonts,
+            dos=dos_i,
             style=style,
             no_base_style=no_base_style,
-            spin=spin,
+            from_json=from_json,
+            color=colors[i % len(colors)], # assign a different color to each iteration
+            legend=legend,  # add legend for each plot
+            legend_labels=legend_labels,  # add legend label for each plot
+            line_style=line_style[i % len(line_style)],
+            handles=handles
         )
 
     if save_files:
-        basename = f"band.{image_format}"
+        basename = f"phonon_band.{image_format}"
         filename = f"{prefix}_{basename}" if prefix else basename
+
         if directory:
             filename = os.path.join(directory, filename)
+
+        if dpi is None:
+            dpi = rcParams["figure.dpi"]
         plt.savefig(filename, format=image_format, dpi=dpi, bbox_inches="tight")
 
-        written = [filename]
-        written += save_data_files(bs, prefix=prefix, directory=directory)
-        return written
-
+        filename = save_data_files(bs, prefix=prefix, directory=directory)
+        return filename
     else:
         return plt
 
 
-def find_vasprun_files():
-    """Search for vasprun files from the current directory.
-
-    The precedence order for file locations is:
-
-      1. First search for folders named: 'split-0*'
-      2. Else, look in the current directory.
-
-    The split folder names should always be zero based, therefore easily
-    sortable.
-    """
-    folders = glob.glob("split-*")
-    folders = sorted(folders) if folders else ["."]
-
-    filenames = []
-    for fol in folders:
-        vr_file = os.path.join(fol, "vasprun.xml")
-        vr_file_gz = os.path.join(fol, "vasprun.xml.gz")
-
-        if os.path.exists(vr_file):
-            filenames.append(vr_file)
-        elif os.path.exists(vr_file_gz):
-            filenames.append(vr_file_gz)
-        else:
-            logging.error(f"ERROR: No vasprun.xml found in {fol}!")
-            sys.exit()
-
-    return filenames
-
-
 def save_data_files(bs, prefix=None, directory=None):
-    """Write the band structure data files to disk.
+    """Write the phonon band structure data files to disk.
 
     Args:
-        bs (`BandStructureSymmLine`): Calculated band structure.
-        prefix (`str`, optional): Prefix for data file.
-        directory (`str`, optional): Directory in which to save the data.
+        bs (:obj:`~pymatgen.phonon.bandstructure.PhononBandStructureSymmLine`):
+            The phonon band structure.
+        prefix (:obj:`str`, optional): Prefix for data file.
+        directory (:obj:`str`, optional): Directory in which to save the data.
 
     Returns:
-        The filename of the written data file.
+        str: The filename of the written data file.
     """
-    filename = f"{prefix}_band.dat" if prefix else "band.dat"
+    filename = "phonon_band.dat"
+    filename = f"{prefix}_phonon_band.dat" if prefix else filename
     directory = directory if directory else "."
     filename = os.path.join(directory, filename)
 
-    if bs.is_metal():
-        zero = bs.efermi
-    else:
-        zero = bs.get_vbm()["energy"]
-
     with open(filename, "w") as f:
-        header = "#k-distance eigenvalue[eV]\n"
+        header = "#k-distance frequency[THz]\n"
         f.write(header)
 
-        # write the spin up eigenvalues
-        for band in bs.bands[Spin.up]:
+        for band in bs.bands:
             for d, e in zip(bs.distance, band):
-                f.write(f"{d:.8f} {e - zero:.8f}\n")
+                f.write(f"{d:.8f} {e:.8f}\n")
             f.write("\n")
 
-        # calculation is spin polarised, write spin down bands at end of file
-        if bs.is_spin_polarized:
-            for band in bs.bands[Spin.down]:
-                for d, e in zip(bs.distance, band):
-                    f.write(f"{d:.8f} {e - zero:.8f}\n")
-                f.write("\n")
     return filename
 
 
-def _el_orb_tuple(string):
-    """Parse the element and orbital argument strings.
+def _bs_from_filename(
+    filename,
+    poscar,
+    dim,
+    symprec,
+    spg,
+    kpt_list,
+    labels,
+    primitive_axis,
+    units,
+    born,
+    mode,
+    eigenvectors,
+    line_density,
+):
+    """Analyse input files to create band structure"""
 
-    The presence of an element without any orbitals means that we want to plot
-    all of its orbitals.
+    if ".yaml" in filename:
+        logging.warning(
+            f"Reading pre-computed band structure from {filename}. "
+            "Be aware that many phonon-bandplot options will not "
+            "be relevant."
+        )
+        yaml_file = filename
+        phonon = None
+        try:
+            poscar = poscar if poscar else "POSCAR"
+            poscar = Poscar.from_file(poscar)
+        except OSError:
+            msg = "Cannot find POSCAR file, cannot generate symmetry path."
+            logging.error(f"\n {msg}")
+            sys.exit()
 
-    Args:
-        string (`str`): The selected elements and orbitals in in the form:
-            `"Sn.s.p,O"`.
+    elif (
+        "FORCE_SETS" in filename or "FORCE_CONSTANTS" in filename or ".hdf5" in filename
+    ):
+        try:
+            poscar = poscar if poscar else "POSCAR"
+            poscar = Poscar.from_file(poscar)
+        except OSError:
+            msg = "Cannot find POSCAR file, cannot generate symmetry path."
+            logging.error(f"\n {msg}")
+            sys.exit()
 
-    Returns:
-        A list of tuples specifying which elements/orbitals to plot. The output
-        for the above example would be:
+        if not dim:
+            logging.info(
+                "Supercell size (--dim option) not provided.\n"
+                "Attempting to guess supercell dimensions.\n"
+            )
+            try:
+                sposcar = Poscar.from_file("SPOSCAR")
+            except OSError:
+                msg = "Could not determine supercell size (use --dim flag)."
+                logging.error(f"\n {msg}")
+                sys.exit()
 
-            `[('Sn', ('s', 'p')), 'O']`
-    """
-    el_orbs = []
-    for split in string.split(","):
-        splits = split.split(".")
-        el = splits[0]
-        if len(splits) == 1:
-            el_orbs.append(el)
+            dim = sposcar.structure.lattice.matrix @ poscar.structure.lattice.inv_matrix
+
+            # round due to numerical noise error
+            dim = np.around(dim, 5)
+
+        elif len(dim) == 9:
+            dim = np.array(dim).reshape(3, 3)
+
+        elif np.array(dim).shape != (3, 3):
+            dim = np.diagflat(dim)
+
+        logging.info("Using supercell with dimensions:")
+        logging.info("\t" + str(dim).replace("\n", "\n\t") + "\n")
+
+        factors = {
+            "ev": VaspToEv,
+            "thz": VaspToTHz,
+            "mev": VaspToEv * 1000,
+            "cm-1": VaspToCm,
+        }
+
+        phonon = load_phonopy(
+            filename,
+            poscar.structure,
+            dim,
+            primitive_matrix=primitive_axis,
+            factor=factors[units.lower()],
+            symmetrise=True,
+            born=born,
+            write_fc=False,
+        )
+    elif ".phonon" in filename:
+        logging.warning(
+            "Reading pre-computed band structure from CASTEP. "
+            "Be aware that many phonon-bandplot options will not "
+            "be relevant."
+        )
+        castep_phonon = CastepPhonon.from_file(filename)
+
+        cell_file = ".".join(filename.split(".")[:-1] + ["cell"])
+        if isfile(cell_file):
+            logging.info(f"Found .cell file, reading x-axis labels from {cell_file}")
+            castep_phonon.set_labels_from_file(cell_file)
         else:
-            el_orbs.append((el, tuple(splits[1:])))
-    return el_orbs
+            logging.warning("No .cell file found, cannot read x-axis labels.")
 
+        factors = {"cm-1": 1.0, "thz": 1 / THzToCm, "ev": CmToEv, "mev": 1000 * CmToEv}
+        castep_phonon.frequencies *= factors[units.lower()]
+        bs = castep_phonon.get_band_structure()
+        return bs, None
 
-def _replace_ext(string, new_ext):
-    """Replace file extension
+    else:
+        msg = f"Do not recognise file type of {filename}"
+        logging.error(f"\n {msg}")
+        sys.exit()
 
-    Args:
-        string (`str`): The file name with extensions to be replace
-        new_ext (`str`): The new extension
+    # calculate band structure
+    kpath, kpoints, labels = get_path_data(
+        poscar.structure,
+        mode=mode,
+        symprec=symprec,
+        spg=spg,
+        kpt_list=kpt_list,
+        labels=labels,
+        phonopy=True,
+        line_density=line_density,
+    )
 
-    Returns:
-        A string with files extension replaced by new_ext
-    """
-    name, _ = os.path.splitext(string)
-    return name + "." + new_ext
+    # todo: calculate dos and plot also
+    # phonon.set_mesh(mesh, is_gamma_center=False, is_eigenvectors=True,
+    #                 is_mesh_symmetry=False)
+    # phonon.set_partial_DOS()
+
+    if ".yaml" not in filename:
+        phonon.run_band_structure(
+            kpoints, with_eigenvectors=eigenvectors, labels=labels
+        )
+        yaml_file = "sumo_band.yaml"
+        phonon.band_structure.write_yaml(filename=yaml_file)
+
+    bs = get_ph_bs_symm_line(yaml_file, has_nac=False, labels_dict=kpath.kpoints)
+    return bs, phonon
 
 
 def _get_parser():
     parser = argparse.ArgumentParser(
         description="""
-    bandplot is a script to produce publication-ready band
+    phonon-bandplot is a script to produce publication ready phonon band
     structure diagrams""",
         epilog=f"""
     Author: {__author__}
@@ -599,227 +498,116 @@ def _get_parser():
 
     parser.add_argument(
         "-f",
-        "--filenames",
+        "--filename",
         default=None,
-        nargs="+",
         metavar="F",
-        help="one or more vasprun.xml files to plot",
+        help="FORCE_SETS, FORCE_CONSTANTS or band.yaml file",
     )
     parser.add_argument(
-        "-c",
-        "--code",
-        default="vasp",
-        help="Electronic structure code (default: vasp)." '"questaal" also supported.',
-    )
-    parser.add_argument(
-        "-p", "--prefix", metavar="P", help="prefix for the files generated"
+        "-p", "--prefix", metavar="P", help="prefix for the files generated."
     )
     parser.add_argument(
         "-d", "--directory", metavar="D", help="output directory for files"
     )
     parser.add_argument(
-        "-b",
-        "--band-edges",
-        dest="band_edges",
-        action="store_true",
-        help="highlight the band edges with markers",
-    )
-    parser.add_argument(
-        "--project",
-        default=None,
-        metavar="S",
-        type=_el_orb_tuple,
-        dest="projection_selection",
-        help=(
-            "select which orbitals to project onto the band "
-            'structure (e.g. "Zn.s,Zn.p,O")'
-        ),
-    )
-    parser.add_argument(
-        "--mode",
-        default="rgb",
-        type=str,
-        help=("mode for orbital projections (options: rgb, stacked)"),
-    )
-    parser.add_argument(
-        "--normalise",
-        default="all",
-        type=str,
-        help=("how to normalise projections (options: all, select)"),
-    )
-    parser.add_argument(
-        "--interpolate-factor",
-        type=int,
-        default=4,
-        dest="interpolate_factor",
+        "-q",
+        "--qmesh",
+        nargs=3,
         metavar="N",
-        help=("interpolate factor for band structure projections (default: 4)"),
+        default=(8, 8, 8),
+        help="q-mesh to use for phonon DOS",
     )
+    parser.add_argument("-b", "--born", metavar="B", help="born effective charge file")
     parser.add_argument(
-        "--cartesian",
+        "-e",
+        "--eigenvectors",
         action="store_true",
-        help="Read cartesian k-point coordinates. This is only"
-        " necessary for some Questaal calculations; Vasp "
-        "outputs are less ambiguous and this option will "
-        "be ignored if --code=vasp.",
+        default=None,
+        help="write the phonon eigenvectors to yaml file",
     )
     parser.add_argument(
-        "--colour1",
-        type=str,
-        default="#FF0000",
-        dest="color1",
-        metavar="C",
-        help="colour1 for rgb projections (default: red)",
+        "--dim", nargs="+", metavar="N", help="supercell matrix dimensions"
     )
     parser.add_argument(
-        "--colour2",
-        type=str,
-        default="#0000FF",
-        dest="color2",
-        metavar="C",
-        help="colour2 for rgb projections (default: blue)",
+        "--poscar",
+        default=None,
+        metavar="POS",
+        help="path to POSCAR file (if FORCE_SETS used)",
+    )
+    prim_axis = parser.add_mutually_exclusive_group()
+    prim_axis.add_argument(
+        "--primitive-axis",
+        type=float,
+        nargs=9,
+        metavar="M",
+        dest="primitive_axis",
+        default=None,
+        help="conventional to primitive cell transformation matrix",
+    )
+    prim_axis.add_argument(
+        "--primitive-auto",
+        action="store_const",
+        dest="primitive_axis",
+        const="auto",
+        help="Let phonopy automatically determine primitive cell transformation",
     )
     parser.add_argument(
-        "--colour3",
-        type=str,
-        default="#00FF00",
-        dest="color3",
-        metavar="C",
-        help="colour3 for rgb projections (default: green)",
+        "--symprec",
+        default=0.01,
+        type=float,
+        help="tolerance for finding symmetry (default: 0.01)",
     )
     parser.add_argument(
-        "--colourspace",
-        type=str,
-        default="lab",
-        dest="colorspace",
-        metavar="C",
-        help=(
-            "colorspace used for interpolation of for rgb projections (options: "
-            "lab[default], rgb, hsv, luvlc, lablch, and xyz)"
-        ),
+        "--units",
+        "-u",
+        metavar="UNITS",
+        default="THz",
+        choices=("THz", "thz", "cm-1", "eV", "ev", "meV", "mev"),
+        help=("choose units of phonon frequency (THz, cm-1, eV, meV)"),
     )
     parser.add_argument(
-        "--circle-size",
+        "--spg", type=str, default=None, help="space group number or symbol"
+    )
+    parser.add_argument(
+        "--density",
         type=int,
-        default=150,
-        dest="circle_size",
-        metavar="S",
-        help='circle size for "stacked" projections (default: 150)',
+        default=60,
+        help="k-point density along high-symmetry path",
     )
     parser.add_argument(
-        "--ylabel",
-        type=str,
-        default="Energy (eV)",
-        help="y-axis (i.e. energy) label/units",
-    )
-    parser.add_argument(
-        "--dos-label",
-        type=str,
-        dest="dos_label",
-        default=None,
-        help="Axis label for DOS if included",
-    )
-    parser.add_argument(
-        "--dos", default=None, help="path to density of states vasprun.xml"
-    )
-
-    parser.add_argument(
-        "--zero-line",
+        "--seekpath",
         action="store_true",
-        dest="zero_line",
-        help="Plot horizontal line at energy zero",
-    )
-
-    parser.add_argument(
-        "--zero-energy",
-        type=float,
-        dest="zero_energy",
-        default=None,
-        help=(
-            "Reference energy: energy will be shifted to place this energy "
-            "at zero. If not specified, zero will be set to the VBM."
-        ),
+        help="use seekpath to generate the high-symmetry path",
     )
     parser.add_argument(
-        "--elements",
-        type=_el_orb,
-        metavar="E",
-        help='elemental orbitals to plot (e.g. "C.s.p,O")',
+        "--pymatgen",
+        action="store_true",
+        help="use pymatgen to generate the high-symmetry path",
     )
     parser.add_argument(
-        "--orbitals",
-        type=_el_orb,
-        metavar="O",
-        help=("orbitals to split into lm-decomposed " 'contributions (e.g. "Ru.d")'),
+        "--cartesian", action="store_true", help="use cartesian k-point coordinates"
     )
     parser.add_argument(
-        "--atoms",
-        type=_atoms,
-        metavar="A",
-        help=('atoms to include (e.g. "O.1.2.3,Ru.1.2.3")'),
-    )
-    parser.add_argument(
-        "--spin",
+        "--kpoints",
         type=str,
         default=None,
-        help=(
-            "select only one spin channel for a "
-            "spin-polarised calculation "
-            "(options: up, 1; down, -1)"
-        ),
+        help=('specify a list of kpoints (e.g. "0 0 0, 0.5 0 0")'),
     )
     parser.add_argument(
-        "--scissor",
-        type=float,
+        "--labels",
+        type=str,
         default=None,
-        dest="scissor",
-        help="apply scissor operator",
-    )
-    parser.add_argument(
-        "--total-only",
-        action="store_true",
-        dest="total_only",
-        help="only plot the total density of states",
-    )
-    parser.add_argument(
-        "--no-total",
-        action="store_false",
-        dest="total",
-        help="don't plot the total density of states",
-    )
-    parser.add_argument(
-        "--legend-cutoff",
-        type=float,
-        default=3,
-        dest="legend_cutoff",
-        metavar="C",
-        help=(
-            "cut-off in %% of total DOS that determines if"
-            " a line is given a label (default: 3)"
-        ),
-    )
-    parser.add_argument(
-        "-g",
-        "--gaussian",
-        type=float,
-        metavar="G",
-        help="standard deviation of DOS gaussian broadening",
-    )
-    parser.add_argument(
-        "--scale",
-        type=float,
-        default=1,
-        help="scaling factor for the density of states",
+        help=r'specify the labels for kpoints (e.g. "\Gamma,X")',
     )
     parser.add_argument(
         "--height", type=float, default=None, help="height of the graph"
     )
     parser.add_argument("--width", type=float, default=None, help="width of the graph")
     parser.add_argument(
-        "--ymin", type=float, default=-6.0, help="minimum energy on the y-axis"
+        "--ymin", type=float, default=None, help="minimum energy on the y-axis"
     )
     parser.add_argument(
-        "--ymax", type=float, default=6.0, help="maximum energy on the y-axis"
+        "--ymax", type=float, default=None, help="maximum energy on the y-axis"
     )
     parser.add_argument(
         "--style",
@@ -846,16 +634,54 @@ def _get_parser():
         help="image file format (options: pdf, svg, jpg, png)",
     )
     parser.add_argument(
-        "--dpi", type=int, default=400, help="pixel density for image file"
+        "--dpi", type=int, default=None, help="pixel density for image file"
     )
     parser.add_argument("--font", default=None, help="font to use")
+    parser.add_argument(
+        "--dos",
+        nargs="?",
+        type=str,
+        default=None,
+        const=True,
+        help="Phonopy .dat file for phonon DOS",
+    )
+    parser.add_argument(
+        "--to-json", type=str, default=None, help="Output JSON file for band data"
+    )
+    parser.add_argument(
+        "--from-json",
+        type=str,
+        nargs="+",
+        default=None,
+        dest="from_json",
+        help="Overlay band data from JSON files",
+    )
+    parser.add_argument(
+        "--to-web",
+        type=str,
+        default=None,
+        dest="to_web",
+        help="(Output JSON file for http://henriquemiranda.github.io/phononwebsite)",
+    )
+    parser.add_argument(
+        "--legend",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Legend labels. With no args, label json inputs "
+            "with filenames. With one arg per json file, "
+            "label json inputs only. With one extra arg, "
+            "label all lines beginning with new plot."
+        ),
+    )
     return parser
 
 
 def main():
     args = _get_parser().parse_args()
     logging.basicConfig(
-        filename="sumo-bandplot.log",
+        filename="sumo-phonon-bandplot.log",
         level=logging.INFO,
         filemode="w",
         format="%(message)s",
@@ -864,60 +690,85 @@ def main():
     logging.info(" ".join(sys.argv[:]))
     logging.getLogger("").addHandler(console)
 
-    if args.config is None:
-        config_path = resource_filename(
-            Requirement.parse("sumo"), "sumo/plotting/orbital_colours.conf"
-        )
-    else:
-        config_path = args.config
-    colours = configparser.ConfigParser()
-    colours.read(os.path.abspath(config_path))
+    mode = "bradcrack"
+    if args.seekpath:
+        mode = "seekpath"
+    elif args.pymatgen:
+        mode = "pymatgen"
+
+    spg = args.spg
+    if args.spg:
+        try:
+            spg = int(spg)
+        except ValueError:
+            pass
+
+    kpoints = None
+    if args.kpoints:
+        kpoints = [
+            [list(map(float, kpt.split())) for kpt in kpts.split(",")]
+            for kpts in args.kpoints.split("|")
+        ]
+    labels = None
+    if args.labels:
+        labels = [path.split(",") for path in args.labels.split("|")]
+
+    dim = list(map(float, args.dim)) if args.dim else None
 
     warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
     warnings.filterwarnings("ignore", category=UnicodeWarning, module="matplotlib")
     warnings.filterwarnings("ignore", category=UserWarning, module="pymatgen")
 
-    bandplot(
-        filenames=args.filenames,
-        code=args.code,
+    if args.primitive_axis == "auto":
+        pa = args.primitive_axis
+    elif args.primitive_axis:
+        pa = np.reshape(args.primitive_axis, (3, 3))
+    else:
+        pa = None
+
+    # Detect 'const' option for --legend and set filenames as legend
+    legend = args.legend
+    if isinstance(legend, list):
+        if len(legend) == 0:
+            if args.from_json:
+                legend = args.from_json.copy()
+            else:
+                raise ValueError(
+                    "Can't generate automatic legend without"
+                    "--from-json; nothing to plot!"
+                )
+
+    phonon_bandplot(
+        args.filename,
+        poscar=args.poscar,
         prefix=args.prefix,
         directory=args.directory,
-        vbm_cbm_marker=args.band_edges,
-        projection_selection=args.projection_selection,
-        mode=args.mode,
-        normalise=args.normalise,
-        interpolate_factor=args.interpolate_factor,
-        cart_coords=args.cartesian,
-        scissor=args.scissor,
-        color1=args.color1,
-        color2=args.color2,
-        color3=args.color3,
-        colorspace=args.colorspace,
-        circle_size=args.circle_size,
-        yscale=args.scale,
-        ylabel=args.ylabel,
-        dos_label=args.dos_label,
-        dos_file=args.dos,
-        zero_line=args.zero_line,
-        zero_energy=args.zero_energy,
-        elements=args.elements,
-        lm_orbitals=args.orbitals,
-        atoms=args.atoms,
-        spin=args.spin,
-        total_only=args.total_only,
-        plot_total=args.total,
-        legend_cutoff=args.legend_cutoff,
-        gaussian=args.gaussian,
+        dim=dim,
+        born=args.born,
+        qmesh=args.qmesh,
+        primitive_axis=pa,
+        symprec=args.symprec,
+        units=args.units,
+        spg=spg,
+        line_density=args.density,
+        mode=mode,
+        kpt_list=kpoints,
+        labels=labels,
         height=args.height,
         width=args.width,
         ymin=args.ymin,
+        ymax=args.ymax,
+        image_format=args.image_format,
         style=args.style,
         no_base_style=args.no_base_style,
-        ymax=args.ymax,
-        colours=colours,
-        image_format=args.image_format,
         dpi=args.dpi,
         fonts=args.font,
+        eigenvectors=args.eigenvectors,
+        dos=args.dos,
+        to_json=args.to_json,
+        from_json=args.from_json,
+        to_web=args.to_web,
+        legend=legend,
     )
 
 
